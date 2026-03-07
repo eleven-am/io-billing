@@ -47,7 +47,15 @@ func adjustedDate(year int, month time.Month, day int) time.Time {
 }
 
 func usageKey(tenantID string, period Period, metric Metric) string {
-	return fmt.Sprintf("billing:usage:%s:%s:%s", tenantID, period.Key(), metric)
+	return usageUsedKey(tenantID, period.Key(), metric)
+}
+
+func usageUsedKey(tenantID, periodKey string, metric Metric) string {
+	return fmt.Sprintf("billing:usage:%s:%s:%s:used", tenantID, periodKey, metric)
+}
+
+func usageReservedKey(tenantID, periodKey string, metric Metric) string {
+	return fmt.Sprintf("billing:usage:%s:%s:%s:reserved", tenantID, periodKey, metric)
 }
 
 func quotaKey(tenantID string, metric Metric) string {
@@ -60,4 +68,12 @@ func reservationKey(reservationID string) string {
 
 func canOverageKey(tenantID string, metric Metric) string {
 	return fmt.Sprintf("billing:can_overage:%s:%s", tenantID, metric)
+}
+
+func enforcementKey(tenantID string, metric Metric) string {
+	return fmt.Sprintf("billing:enforcement:%s:%s", tenantID, metric)
+}
+
+func operationKey(tenantID, action, operationID string) string {
+	return fmt.Sprintf("billing:op:%s:%s:%s", tenantID, action, operationID)
 }

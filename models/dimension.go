@@ -7,6 +7,7 @@ type BillingPlanDimension struct {
 	Included    int64   `gorm:"column:included;not null"`
 	OverageRate float64 `gorm:"column:overage_rate;not null;default:0"`
 	Unit        string  `gorm:"column:unit;not null"`
+	Enforcement string  `gorm:"column:enforcement;not null;default:'hard_cap'"`
 }
 
 func (BillingPlanDimension) TableName() string {

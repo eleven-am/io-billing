@@ -12,6 +12,10 @@ var (
 	ErrNoActivePlan         = errors.New("billing: no active plan")
 	ErrInvalidMetric        = errors.New("billing: invalid metric")
 	ErrReservationNotFound  = errors.New("billing: reservation not found")
+	ErrInvalidPlan          = errors.New("billing: invalid plan")
+	ErrInvalidOperationID   = errors.New("billing: invalid operation id")
+	ErrInvalidAmount        = errors.New("billing: invalid amount")
+	ErrOperationConflict    = errors.New("billing: idempotency conflict")
 )
 
 type QuotaExceededError struct {

@@ -2,19 +2,21 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"strconv"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 type QuotaStatus struct {
-	Metric     Metric
-	Used       int64
-	Limit      int64
-	Remaining  int64
-	Exceeded   bool
-	CanOverage bool
+	Metric      Metric
+	Used        int64
+	Reserved    int64
+	Limit       int64
+	Remaining   int64
+	Exceeded    bool
+	CanOverage  bool
+	Enforcement EnforcementMode
 }
 
 func (c *Client) Check(ctx context.Context, tenantID string, metric Metric) (QuotaStatus, error) {
@@ -27,33 +29,41 @@ func (c *Client) Check(ctx context.Context, tenantID string, metric Metric) (Quo
 		return QuotaStatus{}, err
 	}
 
-	period := CurrentPeriod(sub.StartedAt, time.Now())
-	uKey := usageKey(tenantID, period, metric)
+	period := CurrentPeriod(sub.StartedAt, c.opts.Now())
+	uKey := usageUsedKey(tenantID, period.Key(), metric)
+	rKey := usageReservedKey(tenantID, period.Key(), metric)
 	qKey := quotaKey(tenantID, metric)
 	oKey := canOverageKey(tenantID, metric)
+	eKey := enforcementKey(tenantID, metric)
 
 	pipe := c.redis.Pipeline()
 	usageCmd := pipe.Get(ctx, uKey)
+	reservedCmd := pipe.Get(ctx, rKey)
 	quotaCmd := pipe.Get(ctx, qKey)
 	overageCmd := pipe.Get(ctx, oKey)
+	enforcementCmd := pipe.Get(ctx, eKey)
 	_, _ = pipe.Exec(ctx)
 
 	used := getInt64OrZero(usageCmd)
+	reserved := getInt64OrZero(reservedCmd)
 	limit := getInt64OrZero(quotaCmd)
 	canOverage := getBoolOrFalse(overageCmd)
+	enforcement := getEnforcementOrDefault(enforcementCmd)
 
-	remaining := limit - used
+	remaining := limit - used - reserved
 	if remaining < 0 {
 		remaining = 0
 	}
 
 	return QuotaStatus{
-		Metric:     metric,
-		Used:       used,
-		Limit:      limit,
-		Remaining:  remaining,
-		Exceeded:   used >= limit,
-		CanOverage: canOverage,
+		Metric:      metric,
+		Used:        used,
+		Reserved:    reserved,
+		Limit:       limit,
+		Remaining:   remaining,
+		Exceeded:    used+reserved >= limit,
+		CanOverage:  canOverage,
+		Enforcement: enforcement,
 	}, nil
 }
 
@@ -102,6 +112,9 @@ func (c *Client) setCanOverage(ctx context.Context, tenantID string, metric Metr
 func getInt64OrZero(cmd *redis.StringCmd) int64 {
 	val, err := cmd.Int64()
 	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return 0
+		}
 		return 0
 	}
 	return val
@@ -110,11 +123,60 @@ func getInt64OrZero(cmd *redis.StringCmd) int64 {
 func getBoolOrFalse(cmd *redis.StringCmd) bool {
 	val, err := cmd.Result()
 	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return false
+		}
 		return false
 	}
 	return val == "1" || val == "true"
 }
 
+func getEnforcementOrDefault(cmd *redis.StringCmd) EnforcementMode {
+	val, err := cmd.Result()
+	if err != nil {
+		return EnforcementHardCap
+	}
+	mode := EnforcementMode(val)
+	if !mode.Valid() {
+		return EnforcementHardCap
+	}
+	return mode
+}
+
 func int64ToStr(v int64) string {
 	return strconv.FormatInt(v, 10)
+}
+
+func (c *Client) CanConsume(ctx context.Context, tenantID string, metric Metric, amount int64) (QuotaAdmission, error) {
+	if amount <= 0 {
+		return QuotaAdmission{}, ErrInvalidAmount
+	}
+	status, err := c.Check(ctx, tenantID, metric)
+	if err != nil {
+		return QuotaAdmission{}, err
+	}
+	admission := QuotaAdmission{
+		Metric:      metric,
+		Requested:   amount,
+		Used:        status.Used,
+		Reserved:    status.Reserved,
+		Limit:       status.Limit,
+		Remaining:   status.Remaining,
+		CanOverage:  status.CanOverage,
+		Enforcement: status.Enforcement,
+		CheckedAt:   c.opts.Now(),
+	}
+
+	if status.Enforcement == EnforcementSoftCap {
+		admission.Allowed = true
+		return admission, nil
+	}
+
+	if status.Used+status.Reserved+amount > status.Limit {
+		admission.Allowed = false
+		admission.Reason = "quota_exceeded"
+		return admission, nil
+	}
+	admission.Allowed = true
+	return admission, nil
 }

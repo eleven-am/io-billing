@@ -4,9 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
 
 	"github.com/eleven-am/io-billing/models"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type postgresStore struct {
@@ -22,6 +27,7 @@ func (s *postgresStore) Migrate() error {
 		&models.BillingPlan{},
 		&models.BillingPlanDimension{},
 		&models.BillingTenantSubscription{},
+		&models.BillingUsageLedger{},
 	)
 }
 
@@ -50,6 +56,7 @@ func (s *postgresStore) CreatePlan(ctx context.Context, plan Plan) error {
 			Included:    dim.Included,
 			OverageRate: dim.OverageRate,
 			Unit:        dim.Unit,
+			Enforcement: string(dim.Enforcement),
 		}
 		if err := s.db.WithContext(ctx).Create(&dimModel).Error; err != nil {
 			return err
@@ -82,6 +89,7 @@ func (s *postgresStore) UpdatePlan(ctx context.Context, plan Plan) error {
 			Included:    dim.Included,
 			OverageRate: dim.OverageRate,
 			Unit:        dim.Unit,
+			Enforcement: string(dim.Enforcement),
 		}
 		if err := s.db.WithContext(ctx).Create(&dimModel).Error; err != nil {
 			return err
@@ -189,6 +197,7 @@ func (s *postgresStore) loadPlanDimensions(ctx context.Context, model models.Bil
 			Included:    d.Included,
 			OverageRate: d.OverageRate,
 			Unit:        d.Unit,
+			Enforcement: EnforcementMode(d.Enforcement),
 		}
 	}
 
@@ -207,4 +216,86 @@ func newID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+type LedgerEntry struct {
+	TenantID            string
+	SubscriptionID      string
+	PlanID              string
+	Metric              Metric
+	Action              string
+	OperationID         string
+	PeriodStart         string
+	PeriodEnd           string
+	Units               int64
+	ReservedUnits       int64
+	IncludedSnapshot    int64
+	OverageRateSnapshot float64
+	Unit                string
+	Metadata            map[string]any
+}
+
+func (s *postgresStore) CreateLedgerEntry(ctx context.Context, entry LedgerEntry) error {
+	if entry.TenantID == "" || entry.OperationID == "" || entry.Action == "" {
+		return fmt.Errorf("invalid ledger entry")
+	}
+
+	metadata := "{}"
+	if len(entry.Metadata) > 0 {
+		b, err := json.Marshal(entry.Metadata)
+		if err != nil {
+			return err
+		}
+		metadata = string(b)
+	}
+
+	periodStart, err := parsePeriodKey(entry.PeriodStart)
+	if err != nil {
+		return err
+	}
+	periodEnd, err := parsePeriodKey(entry.PeriodEnd)
+	if err != nil {
+		return err
+	}
+	periodEnd = periodEnd.Add(24*time.Hour - time.Nanosecond)
+
+	model := models.BillingUsageLedger{
+		ID:                  newID(),
+		TenantID:            entry.TenantID,
+		SubscriptionID:      entry.SubscriptionID,
+		PlanID:              entry.PlanID,
+		Metric:              string(entry.Metric),
+		Action:              entry.Action,
+		OperationID:         entry.OperationID,
+		PeriodStart:         periodStart,
+		PeriodEnd:           periodEnd,
+		Units:               entry.Units,
+		ReservedUnits:       entry.ReservedUnits,
+		IncludedSnapshot:    entry.IncludedSnapshot,
+		OverageRateSnapshot: entry.OverageRateSnapshot,
+		Unit:                entry.Unit,
+		MetadataJSON:        metadata,
+	}
+
+	err = s.db.WithContext(ctx).
+		Clauses(clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "tenant_id"},
+				{Name: "action"},
+				{Name: "operation_id"},
+			},
+			DoNothing: true,
+		}).
+		Create(&model).Error
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func parsePeriodKey(key string) (time.Time, error) {
+	if key == "" {
+		return time.Time{}, errors.New("empty period key")
+	}
+	return time.Parse("2006-01-02", key)
 }

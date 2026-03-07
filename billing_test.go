@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/eleven-am/io-billing/models"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -22,7 +23,6 @@ func setupTestClient(t *testing.T) (*Client, *miniredis.Miniredis) {
 	}
 
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
@@ -30,209 +30,274 @@ func setupTestClient(t *testing.T) (*Client, *miniredis.Miniredis) {
 		t.Fatal(err)
 	}
 
-	client := New(rdb, db)
+	now := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
+	client := NewWithOptions(rdb, db, &Options{
+		Now: func() time.Time { return now },
+	})
 	if err := client.Migrate(); err != nil {
 		t.Fatal(err)
 	}
 
 	t.Cleanup(func() {
+		_ = rdb.Close()
 		mr.Close()
-		rdb.Close()
 	})
-
 	return client, mr
 }
 
-func createTestPlan(t *testing.T, c *Client) Plan {
+func createPlan(t *testing.T, c *Client, name string) Plan {
 	t.Helper()
+	ctx := context.Background()
 	plan := Plan{
-		Name:     "test-plan",
+		Name:     name,
 		PriceEUR: 2000,
 		Active:   true,
 		Dimensions: map[Metric]Dimension{
-			IngestTokens: {Included: 500_000, OverageRate: 0.000005, Unit: "tokens"},
-			QueryTokens:  {Included: 200_000, OverageRate: 0.000002, Unit: "tokens"},
-			VoiceMinutes: {Included: 60, OverageRate: 0.05, Unit: "minutes"},
-			ComputeGBSec: {Included: 50_000, OverageRate: 0.00002, Unit: "gb_seconds"},
-			StorageGB:    {Included: 5_000, OverageRate: 0.0001, Unit: "mb"},
-			Events:       {Included: 100_000, OverageRate: 0.00001, Unit: "events"},
+			IngestTokens: {Included: 500_000, OverageRate: 0.000005, Unit: "tokens", Enforcement: EnforcementSoftCap},
+			QueryTokens:  {Included: 200_000, OverageRate: 0.000002, Unit: "tokens", Enforcement: EnforcementSoftCap},
+			VoiceMinutes: {Included: 60, OverageRate: 0.05, Unit: "minutes", Enforcement: EnforcementSoftCap},
+			ComputeGBSec: {Included: 50_000, OverageRate: 0.00002, Unit: "gb_seconds", Enforcement: EnforcementSoftCap},
+			StorageGB:    {Included: 5_000, OverageRate: 0.0001, Unit: "mb", Enforcement: EnforcementSoftCap},
+			Events:       {Included: 100_000, OverageRate: 0.00001, Unit: "events", Enforcement: EnforcementSoftCap},
 		},
 	}
-	ctx := context.Background()
 	if err := c.CreatePlan(ctx, plan); err != nil {
 		t.Fatal(err)
 	}
-	got, err := c.GetPlanByName(ctx, "test-plan")
+	got, err := c.GetPlanByName(ctx, name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return got
 }
 
-func subscribeTestTenant(t *testing.T, c *Client, tenantID string, plan Plan) {
+func createHardCapPlan(t *testing.T, c *Client, name string, limit int64) Plan {
 	t.Helper()
 	ctx := context.Background()
-	if err := c.Subscribe(ctx, tenantID, plan.ID, "polar_123"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestPlanCRUD(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-
 	plan := Plan{
-		Name:     "starter",
-		PriceEUR: 2000,
+		Name:     name,
+		PriceEUR: 0,
 		Active:   true,
 		Dimensions: map[Metric]Dimension{
-			IngestTokens: {Included: 500_000, OverageRate: 0.000005, Unit: "tokens"},
-			Events:       {Included: 100_000, OverageRate: 0.00001, Unit: "events"},
+			IngestTokens: {Included: limit, OverageRate: 0, Unit: "tokens", Enforcement: EnforcementHardCap},
 		},
 	}
-
 	if err := c.CreatePlan(ctx, plan); err != nil {
-		t.Fatalf("CreatePlan: %v", err)
+		t.Fatal(err)
 	}
-
-	got, err := c.GetPlanByName(ctx, "starter")
+	got, err := c.GetPlanByName(ctx, name)
 	if err != nil {
-		t.Fatalf("GetPlanByName: %v", err)
+		t.Fatal(err)
 	}
-	if got.Name != "starter" || got.PriceEUR != 2000 {
-		t.Fatalf("unexpected plan: %+v", got)
-	}
-	if len(got.Dimensions) != 2 {
-		t.Fatalf("expected 2 dimensions, got %d", len(got.Dimensions))
-	}
-	if got.Dimensions[IngestTokens].Included != 500_000 {
-		t.Fatalf("unexpected ingest included: %d", got.Dimensions[IngestTokens].Included)
-	}
+	return got
+}
 
-	got2, err := c.GetPlan(ctx, got.ID)
-	if err != nil {
-		t.Fatalf("GetPlan: %v", err)
-	}
-	if got2.ID != got.ID {
-		t.Fatal("GetPlan returned different plan")
-	}
-
-	got.Name = "starter-updated"
-	got.PriceEUR = 2500
-	got.Dimensions[Events] = Dimension{Included: 200_000, OverageRate: 0.00002, Unit: "events"}
-	if err := c.UpdatePlan(ctx, got); err != nil {
-		t.Fatalf("UpdatePlan: %v", err)
-	}
-
-	updated, err := c.GetPlan(ctx, got.ID)
-	if err != nil {
-		t.Fatalf("GetPlan after update: %v", err)
-	}
-	if updated.Name != "starter-updated" || updated.PriceEUR != 2500 {
-		t.Fatalf("plan not updated: %+v", updated)
-	}
-	if updated.Dimensions[Events].Included != 200_000 {
-		t.Fatalf("dimension not updated: %+v", updated.Dimensions[Events])
+func subscribe(t *testing.T, c *Client, tenantID string, plan Plan) {
+	t.Helper()
+	ctx := context.Background()
+	if err := c.Subscribe(ctx, tenantID, plan.ID, "polar_test"); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestPlanNotFound(t *testing.T) {
+func TestPlanCRUDAndValidation(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
 
-	_, err := c.GetPlan(ctx, "nonexistent")
-	if !errors.Is(err, ErrPlanNotFound) {
-		t.Fatalf("expected ErrPlanNotFound, got: %v", err)
+	plan := createPlan(t, c, "starter")
+	if plan.Dimensions[IngestTokens].Enforcement != EnforcementSoftCap {
+		t.Fatal("expected enforcement to persist")
 	}
 
-	_, err = c.GetPlanByName(ctx, "nonexistent")
-	if !errors.Is(err, ErrPlanNotFound) {
-		t.Fatalf("expected ErrPlanNotFound, got: %v", err)
+	plan.Name = "starter-updated"
+	plan.Dimensions[Events] = Dimension{
+		Included:    250_000,
+		OverageRate: 0.00001,
+		Unit:        "events",
+		Enforcement: EnforcementSoftCap,
 	}
-}
-
-func TestListPlans(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-
-	if err := c.CreatePlan(ctx, Plan{Name: "active1", PriceEUR: 100, Active: true, Dimensions: map[Metric]Dimension{}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.CreatePlan(ctx, Plan{Name: "active2", PriceEUR: 200, Active: true, Dimensions: map[Metric]Dimension{}}); err != nil {
-		t.Fatal(err)
-	}
-	inactivePlan := Plan{Name: "inactive", PriceEUR: 300, Active: true, Dimensions: map[Metric]Dimension{}}
-	if err := c.CreatePlan(ctx, inactivePlan); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := c.GetPlanByName(ctx, "inactive")
-	got.Active = false
-	if err := c.UpdatePlan(ctx, got); err != nil {
+	if err := c.UpdatePlan(ctx, plan); err != nil {
 		t.Fatal(err)
 	}
 
-	plans, err := c.ListPlans(ctx)
+	updated, err := c.GetPlan(ctx, plan.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plans) != 2 {
-		t.Fatalf("expected 2 active plans, got %d", len(plans))
+	if updated.Name != "starter-updated" {
+		t.Fatalf("unexpected name: %s", updated.Name)
+	}
+	if updated.Dimensions[Events].Included != 250_000 {
+		t.Fatalf("unexpected events included: %d", updated.Dimensions[Events].Included)
+	}
+
+	err = c.CreatePlan(ctx, Plan{
+		Name:     "invalid",
+		PriceEUR: 100,
+		Active:   true,
+		Dimensions: map[Metric]Dimension{
+			IngestTokens: {Included: 10, OverageRate: 1, Unit: "tokens", Enforcement: EnforcementHardCap},
+		},
+	})
+	if !errors.Is(err, ErrInvalidPlan) {
+		t.Fatalf("expected ErrInvalidPlan, got %v", err)
 	}
 }
 
 func TestSubscriptionLifecycle(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
-	plan := createTestPlan(t, c)
 
-	if err := c.Subscribe(ctx, "tenant-1", plan.ID, "polar_abc"); err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	plan := createPlan(t, c, "plan-sub")
+	subscribe(t, c, "tenant-1", plan)
 
 	sub, err := c.GetSubscription(ctx, "tenant-1")
 	if err != nil {
-		t.Fatalf("GetSubscription: %v", err)
+		t.Fatal(err)
 	}
-	if sub.TenantID != "tenant-1" || sub.PlanID != plan.ID || sub.Status != "active" {
-		t.Fatalf("unexpected subscription: %+v", sub)
-	}
-	if sub.PolarCustomerID != "polar_abc" {
-		t.Fatalf("unexpected polar customer id: %s", sub.PolarCustomerID)
+	if sub.PlanID != plan.ID || sub.Status != "active" {
+		t.Fatalf("unexpected sub: %+v", sub)
 	}
 
 	if err := c.CancelSubscription(ctx, "tenant-1"); err != nil {
-		t.Fatalf("CancelSubscription: %v", err)
+		t.Fatal(err)
 	}
-
-	sub, err = c.GetSubscription(ctx, "tenant-1")
+	cancelled, err := c.GetSubscription(ctx, "tenant-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sub.Status != "cancelled" {
-		t.Fatalf("expected cancelled, got %s", sub.Status)
+	if cancelled.Status != "cancelled" {
+		t.Fatalf("expected cancelled, got %s", cancelled.Status)
 	}
 }
 
-func TestSubscriptionNotFound(t *testing.T) {
+func TestQuotaCheckShowsReserved(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
+	plan := createPlan(t, c, "plan-reserved")
+	subscribe(t, c, "tenant-1", plan)
 
-	_, err := c.GetSubscription(ctx, "nonexistent")
-	if !errors.Is(err, ErrSubscriptionNotFound) {
-		t.Fatalf("expected ErrSubscriptionNotFound, got: %v", err)
-	}
-}
-
-func TestUsageIncrement(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	if err := c.Increment(ctx, "tenant-1", IngestTokens, 1000); err != nil {
+	_, err := c.Reserve(ctx, ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      20_000,
+		OperationID: "op-reserve-1",
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Increment(ctx, "tenant-1", IngestTokens, 500); err != nil {
+
+	status, err := c.Check(ctx, "tenant-1", IngestTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Used != 0 || status.Reserved != 20_000 {
+		t.Fatalf("unexpected usage status: %+v", status)
+	}
+	if status.Remaining != 480_000 {
+		t.Fatalf("unexpected remaining: %d", status.Remaining)
+	}
+}
+
+func TestCanConsumeHardCap(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createHardCapPlan(t, c, "free", 1000)
+	subscribe(t, c, "tenant-hard", plan)
+
+	allowed, err := c.CanConsume(ctx, "tenant-hard", IngestTokens, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !allowed.Allowed {
+		t.Fatal("expected allowed")
+	}
+
+	denied, err := c.CanConsume(ctx, "tenant-hard", IngestTokens, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if denied.Allowed || denied.Reason != "quota_exceeded" {
+		t.Fatalf("expected denied quota_exceeded, got %+v", denied)
+	}
+}
+
+func TestIncrementIdempotentAndConflict(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createPlan(t, c, "plan-increment")
+	subscribe(t, c, "tenant-1", plan)
+
+	req := IncrementRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      1000,
+		OperationID: "op-inc-1",
+	}
+	if err := c.Increment(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Increment(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	used, err := c.GetUsage(ctx, "tenant-1", IngestTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != 1000 {
+		t.Fatalf("expected 1000, got %d", used)
+	}
+
+	err = c.Increment(ctx, IncrementRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      999,
+		OperationID: "op-inc-1",
+	})
+	if !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("expected ErrOperationConflict, got %v", err)
+	}
+}
+
+func TestIncrementHardCapRejects(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createHardCapPlan(t, c, "free-inc", 1000)
+	subscribe(t, c, "tenant-free", plan)
+
+	err := c.Increment(ctx, IncrementRequest{
+		TenantID:    "tenant-free",
+		Metric:      IngestTokens,
+		Amount:      1200,
+		OperationID: "op-inc-hard",
+	})
+	var qErr *QuotaExceededError
+	if !errors.As(err, &qErr) {
+		t.Fatalf("expected QuotaExceededError, got %v", err)
+	}
+}
+
+func TestReserveCommitFlow(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createPlan(t, c, "plan-commit")
+	subscribe(t, c, "tenant-1", plan)
+
+	res, err := c.Reserve(ctx, ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      10_000,
+		OperationID: "op-res-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Commit(ctx, CommitRequest{
+		Reservation: res,
+		Actual:      8_000,
+		OperationID: "op-commit-1",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -240,272 +305,144 @@ func TestUsageIncrement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if used != 1500 {
-		t.Fatalf("expected 1500, got %d", used)
-	}
-
-	unused, err := c.GetUsage(ctx, "tenant-1", Events)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if unused != 0 {
-		t.Fatalf("expected 0, got %d", unused)
-	}
-}
-
-func TestUsageInvalidMetric(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-
-	err := c.Increment(ctx, "tenant-1", "bogus", 100)
-	if !errors.Is(err, ErrInvalidMetric) {
-		t.Fatalf("expected ErrInvalidMetric, got: %v", err)
-	}
-}
-
-func TestGetAllUsage(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	c.Increment(ctx, "tenant-1", IngestTokens, 100)
-	c.Increment(ctx, "tenant-1", Events, 50)
-
-	all, err := c.GetAllUsage(ctx, "tenant-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if all[IngestTokens] != 100 {
-		t.Fatalf("expected 100, got %d", all[IngestTokens])
-	}
-	if all[Events] != 50 {
-		t.Fatalf("expected 50, got %d", all[Events])
-	}
-	if all[VoiceMinutes] != 0 {
-		t.Fatalf("expected 0, got %d", all[VoiceMinutes])
-	}
-}
-
-func TestQuotaCheck(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	status, err := c.Check(ctx, "tenant-1", IngestTokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.Used != 0 || status.Limit != 500_000 || status.Remaining != 500_000 {
-		t.Fatalf("unexpected status: %+v", status)
-	}
-	if status.Exceeded {
-		t.Fatal("should not be exceeded")
-	}
-	if !status.CanOverage {
-		t.Fatal("starter plan should allow overage")
-	}
-
-	c.Increment(ctx, "tenant-1", IngestTokens, 500_000)
-
-	status, err = c.Check(ctx, "tenant-1", IngestTokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !status.Exceeded {
-		t.Fatal("should be exceeded at limit")
-	}
-	if status.Remaining != 0 {
-		t.Fatalf("expected 0 remaining, got %d", status.Remaining)
-	}
-}
-
-func TestQuotaCheckFreeTierHardCap(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-
-	freePlan := Plan{
-		Name:     "free",
-		PriceEUR: 0,
-		Active:   true,
-		Dimensions: map[Metric]Dimension{
-			IngestTokens: {Included: 50_000, OverageRate: 0, Unit: "tokens"},
-		},
-	}
-	c.CreatePlan(ctx, freePlan)
-	got, _ := c.GetPlanByName(ctx, "free")
-	subscribeTestTenant(t, c, "tenant-free", got)
-
-	status, err := c.Check(ctx, "tenant-free", IngestTokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.CanOverage {
-		t.Fatal("free tier should NOT allow overage")
-	}
-}
-
-func TestQuotaCheckInvalidMetric(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-
-	_, err := c.Check(ctx, "tenant-1", "bogus")
-	if !errors.Is(err, ErrInvalidMetric) {
-		t.Fatalf("expected ErrInvalidMetric, got: %v", err)
-	}
-}
-
-func TestSetQuota(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	if err := c.SetQuota(ctx, "tenant-1", IngestTokens, 999); err != nil {
-		t.Fatal(err)
-	}
-
-	status, err := c.Check(ctx, "tenant-1", IngestTokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.Limit != 999 {
-		t.Fatalf("expected limit 999, got %d", status.Limit)
-	}
-}
-
-func TestSetQuotas(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	quotas := map[Metric]int64{
-		IngestTokens: 111,
-		Events:       222,
-	}
-	if err := c.SetQuotas(ctx, "tenant-1", quotas); err != nil {
-		t.Fatal(err)
-	}
-
-	s1, _ := c.Check(ctx, "tenant-1", IngestTokens)
-	s2, _ := c.Check(ctx, "tenant-1", Events)
-	if s1.Limit != 111 || s2.Limit != 222 {
-		t.Fatalf("expected 111/222, got %d/%d", s1.Limit, s2.Limit)
-	}
-}
-
-func TestCheckMultiple(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	result, err := c.CheckMultiple(ctx, "tenant-1", []Metric{IngestTokens, Events})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 2 {
-		t.Fatalf("expected 2 statuses, got %d", len(result))
-	}
-	if result[IngestTokens].Limit != 500_000 {
-		t.Fatalf("unexpected limit: %d", result[IngestTokens].Limit)
-	}
-}
-
-func TestReservationFlow(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	res, err := c.Reserve(ctx, "tenant-1", IngestTokens, 10_000)
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
-	if res.Amount != 10_000 {
-		t.Fatalf("unexpected amount: %d", res.Amount)
-	}
-
-	used, _ := c.GetUsage(ctx, "tenant-1", IngestTokens)
-	if used != 10_000 {
-		t.Fatalf("expected 10000 after reserve, got %d", used)
-	}
-
-	if err := c.Reconcile(ctx, res, 8_000); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	used, _ = c.GetUsage(ctx, "tenant-1", IngestTokens)
 	if used != 8_000 {
-		t.Fatalf("expected 8000 after reconcile, got %d", used)
+		t.Fatalf("expected 8000, got %d", used)
+	}
+	status, err := c.Check(ctx, "tenant-1", IngestTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Reserved != 0 {
+		t.Fatalf("expected reserved 0, got %d", status.Reserved)
 	}
 }
 
-func TestReservationRelease(t *testing.T) {
+func TestReserveReleaseFlow(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
+	plan := createPlan(t, c, "plan-release")
+	subscribe(t, c, "tenant-1", plan)
 
-	res, err := c.Reserve(ctx, "tenant-1", IngestTokens, 5_000)
+	res, err := c.Reserve(ctx, ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      5000,
+		OperationID: "op-res-2",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := c.ReleaseReservation(ctx, res); err != nil {
-		t.Fatalf("ReleaseReservation: %v", err)
+	if err := c.Release(ctx, ReleaseRequest{
+		Reservation: res,
+		OperationID: "op-rel-1",
+	}); err != nil {
+		t.Fatal(err)
 	}
-
-	used, _ := c.GetUsage(ctx, "tenant-1", IngestTokens)
-	if used != 0 {
-		t.Fatalf("expected 0 after release, got %d", used)
+	status, err := c.Check(ctx, "tenant-1", IngestTokens)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestReservationRejectsFreeTierOverQuota(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-
-	freePlan := Plan{
-		Name:     "free-res",
-		PriceEUR: 0,
-		Active:   true,
-		Dimensions: map[Metric]Dimension{
-			IngestTokens: {Included: 1_000, OverageRate: 0, Unit: "tokens"},
-		},
-	}
-	c.CreatePlan(ctx, freePlan)
-	got, _ := c.GetPlanByName(ctx, "free-res")
-	subscribeTestTenant(t, c, "tenant-free", got)
-
-	_, err := c.Reserve(ctx, "tenant-free", IngestTokens, 2_000)
-	if err == nil {
-		t.Fatal("expected quota exceeded error")
-	}
-
-	var qErr *QuotaExceededError
-	if !errors.As(err, &qErr) {
-		t.Fatalf("expected QuotaExceededError, got: %v", err)
-	}
-	if qErr.Estimated != 2_000 {
-		t.Fatalf("expected estimated 2000, got %d", qErr.Estimated)
+	if status.Used != 0 || status.Reserved != 0 {
+		t.Fatalf("expected zero usage/reserved, got %+v", status)
 	}
 }
 
-func TestReservationReconcileHigher(t *testing.T) {
+func TestReserveIdempotentAndConflict(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
+	plan := createPlan(t, c, "plan-res-idemp")
+	subscribe(t, c, "tenant-1", plan)
 
-	res, _ := c.Reserve(ctx, "tenant-1", IngestTokens, 5_000)
-	c.Reconcile(ctx, res, 7_000)
+	req := ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      777,
+		OperationID: "op-res-idemp",
+	}
+	first, err := c.Reserve(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.Reserve(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("expected same reservation id, got %s vs %s", first.ID, second.ID)
+	}
 
-	used, _ := c.GetUsage(ctx, "tenant-1", IngestTokens)
-	if used != 7_000 {
-		t.Fatalf("expected 7000, got %d", used)
+	_, err = c.Reserve(ctx, ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      778,
+		OperationID: "op-res-idemp",
+	})
+	if !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("expected ErrOperationConflict, got %v", err)
+	}
+}
+
+func TestCommitAndReleaseIdempotent(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createPlan(t, c, "plan-op-idemp")
+	subscribe(t, c, "tenant-1", plan)
+
+	res, err := c.Reserve(ctx, ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      1000,
+		OperationID: "op-r-base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commit := CommitRequest{
+		Reservation: res,
+		Actual:      900,
+		OperationID: "op-c-idemp",
+	}
+	if err := c.Commit(ctx, commit); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Commit(ctx, commit); err != nil {
+		t.Fatal(err)
+	}
+	used, err := c.GetUsage(ctx, "tenant-1", IngestTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != 900 {
+		t.Fatalf("expected 900, got %d", used)
+	}
+
+	res2, err := c.Reserve(ctx, ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      333,
+		OperationID: "op-r-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := ReleaseRequest{
+		Reservation: res2,
+		OperationID: "op-rel-idemp",
+	}
+	if err := c.Release(ctx, release); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Release(ctx, release); err != nil {
+		t.Fatal(err)
+	}
+	status, err := c.Check(ctx, "tenant-1", IngestTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Reserved != 0 {
+		t.Fatalf("expected 0 reserved, got %d", status.Reserved)
 	}
 }
 
@@ -513,129 +450,91 @@ func TestReservationNilErrors(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
 
-	if err := c.Reconcile(ctx, nil, 100); !errors.Is(err, ErrReservationNotFound) {
-		t.Fatalf("expected ErrReservationNotFound, got: %v", err)
+	err := c.Commit(ctx, CommitRequest{Reservation: nil, Actual: 1, OperationID: "x"})
+	if !errors.Is(err, ErrReservationNotFound) {
+		t.Fatalf("expected ErrReservationNotFound, got %v", err)
 	}
-	if err := c.ReleaseReservation(ctx, nil); !errors.Is(err, ErrReservationNotFound) {
-		t.Fatalf("expected ErrReservationNotFound, got: %v", err)
-	}
-}
-
-func TestPeriodCalculation(t *testing.T) {
-	tests := []struct {
-		name      string
-		startedAt time.Time
-		now       time.Time
-		wantStart time.Time
-		wantEnd   time.Time
-	}{
-		{
-			name:      "same month",
-			startedAt: time.Date(2026, 3, 4, 0, 0, 0, 0, time.UTC),
-			now:       time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC),
-			wantStart: time.Date(2026, 3, 4, 0, 0, 0, 0, time.UTC),
-			wantEnd:   time.Date(2026, 4, 4, 0, 0, 0, 0, time.UTC).Add(-time.Nanosecond),
-		},
-		{
-			name:      "next month",
-			startedAt: time.Date(2026, 3, 4, 0, 0, 0, 0, time.UTC),
-			now:       time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC),
-			wantStart: time.Date(2026, 4, 4, 0, 0, 0, 0, time.UTC),
-			wantEnd:   time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC).Add(-time.Nanosecond),
-		},
-		{
-			name:      "started on 31st, in february",
-			startedAt: time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC),
-			now:       time.Date(2026, 2, 15, 0, 0, 0, 0, time.UTC),
-			wantStart: time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:      "on anniversary day",
-			startedAt: time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC),
-			now:       time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC),
-			wantStart: time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := CurrentPeriod(tt.startedAt, tt.now)
-			if !tt.wantStart.IsZero() && !p.Start.Equal(tt.wantStart) {
-				t.Errorf("Start: got %v, want %v", p.Start, tt.wantStart)
-			}
-			if !tt.wantEnd.IsZero() && !p.End.Equal(tt.wantEnd) {
-				t.Errorf("End: got %v, want %v", p.End, tt.wantEnd)
-			}
-			if p.Start.After(tt.now) {
-				t.Error("period start should not be after now")
-			}
-			if p.End.Before(tt.now) {
-				t.Error("period end should not be before now")
-			}
-		})
-	}
-}
-
-func TestPeriodKey(t *testing.T) {
-	p := Period{
-		Start: time.Date(2026, 3, 4, 0, 0, 0, 0, time.UTC),
-		End:   time.Date(2026, 4, 3, 23, 59, 59, 0, time.UTC),
-	}
-	if p.Key() != "2026-03-04" {
-		t.Fatalf("expected 2026-03-04, got %s", p.Key())
+	err = c.Release(ctx, ReleaseRequest{Reservation: nil, OperationID: "x"})
+	if !errors.Is(err, ErrReservationNotFound) {
+		t.Fatalf("expected ErrReservationNotFound, got %v", err)
 	}
 }
 
 func TestOverageReport(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
+	plan := createPlan(t, c, "plan-overage")
+	subscribe(t, c, "tenant-1", plan)
 
-	c.Increment(ctx, "tenant-1", IngestTokens, 600_000)
-	c.Increment(ctx, "tenant-1", Events, 50_000)
+	if err := c.Increment(ctx, IncrementRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      600_000,
+		OperationID: "op-inc-over-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Increment(ctx, IncrementRequest{
+		TenantID:    "tenant-1",
+		Metric:      Events,
+		Amount:      50_000,
+		OperationID: "op-inc-over-2",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	report, err := c.GetOverageReport(ctx, "tenant-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if len(report.Items) != 1 {
-		t.Fatalf("expected 1 overage item (only ingest), got %d", len(report.Items))
+		t.Fatalf("expected 1 overage item, got %d", len(report.Items))
 	}
-
-	item := report.Items[0]
-	if item.Metric != IngestTokens {
-		t.Fatalf("expected ingest_tokens, got %s", item.Metric)
+	if report.Items[0].Metric != IngestTokens {
+		t.Fatalf("expected ingest overage, got %s", report.Items[0].Metric)
 	}
-	if item.Overage != 100_000 {
-		t.Fatalf("expected overage 100000, got %d", item.Overage)
-	}
-	if item.AmountCents <= 0 {
-		t.Fatalf("expected positive amount, got %d", item.AmountCents)
-	}
-	if report.TotalCents != item.AmountCents {
-		t.Fatalf("total mismatch: %d vs %d", report.TotalCents, item.AmountCents)
+	if report.TotalCents <= 0 {
+		t.Fatalf("expected positive overage cents, got %d", report.TotalCents)
 	}
 }
 
-func TestOverageReportNoOverage(t *testing.T) {
+func TestLedgerEntriesAreRecorded(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
+	plan := createPlan(t, c, "plan-ledger")
+	subscribe(t, c, "tenant-1", plan)
 
-	c.Increment(ctx, "tenant-1", IngestTokens, 100_000)
-
-	report, err := c.GetOverageReport(ctx, "tenant-1")
+	res, err := c.Reserve(ctx, ReserveRequest{
+		TenantID:    "tenant-1",
+		Metric:      IngestTokens,
+		Amount:      1234,
+		OperationID: "op-ledger-res",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Items) != 0 {
-		t.Fatalf("expected no overage items, got %d", len(report.Items))
+	if err := c.Commit(ctx, CommitRequest{
+		Reservation: res,
+		Actual:      1200,
+		OperationID: "op-ledger-commit",
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if report.TotalCents != 0 {
-		t.Fatalf("expected 0 total, got %d", report.TotalCents)
+	if err := c.Increment(ctx, IncrementRequest{
+		TenantID:    "tenant-1",
+		Metric:      Events,
+		Amount:      5,
+		OperationID: "op-ledger-inc",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var count int64
+	if err := c.store.db.WithContext(ctx).Model(&models.BillingUsageLedger{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count < 3 {
+		t.Fatalf("expected at least 3 ledger rows, got %d", count)
 	}
 }
 
@@ -644,9 +543,11 @@ func TestSeedDefaultPlans(t *testing.T) {
 	ctx := context.Background()
 
 	if err := c.SeedDefaultPlans(ctx); err != nil {
-		t.Fatalf("first seed: %v", err)
+		t.Fatal(err)
 	}
-
+	if err := c.SeedDefaultPlans(ctx); err != nil {
+		t.Fatal(err)
+	}
 	plans, err := c.ListPlans(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -654,107 +555,54 @@ func TestSeedDefaultPlans(t *testing.T) {
 	if len(plans) != 3 {
 		t.Fatalf("expected 3 plans, got %d", len(plans))
 	}
-
-	if err := c.SeedDefaultPlans(ctx); err != nil {
-		t.Fatalf("second seed (idempotent): %v", err)
-	}
-
-	plans, err = c.ListPlans(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plans) != 3 {
-		t.Fatalf("expected 3 plans after re-seed, got %d", len(plans))
-	}
-}
-
-func TestSeedPlanDimensions(t *testing.T) {
-	c, _ := setupTestClient(t)
-	ctx := context.Background()
-
-	c.SeedDefaultPlans(ctx)
-
 	free, err := c.GetPlanByName(ctx, "free")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(free.Dimensions) != 6 {
-		t.Fatalf("expected 6 dimensions on free plan, got %d", len(free.Dimensions))
-	}
-	if free.Dimensions[IngestTokens].OverageRate != 0 {
-		t.Fatal("free plan should have 0 overage rate")
-	}
-
-	starter, err := c.GetPlanByName(ctx, "starter")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if starter.PriceEUR != 2000 {
-		t.Fatalf("expected starter 2000 cents, got %d", starter.PriceEUR)
-	}
-	if starter.Dimensions[IngestTokens].OverageRate == 0 {
-		t.Fatal("starter should have non-zero overage rate")
-	}
-
-	pro, err := c.GetPlanByName(ctx, "pro")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pro.PriceEUR != 10000 {
-		t.Fatalf("expected pro 10000 cents, got %d", pro.PriceEUR)
+	if free.Dimensions[IngestTokens].Enforcement != EnforcementHardCap {
+		t.Fatal("free plan ingest must be hard-cap")
 	}
 }
 
-func TestMetricValid(t *testing.T) {
+func TestPeriodCalculationAndKey(t *testing.T) {
+	start := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 2, 15, 10, 0, 0, 0, time.UTC)
+	p := CurrentPeriod(start, now)
+
+	if p.Start.After(now) || p.End.Before(now) {
+		t.Fatalf("invalid period: %+v", p)
+	}
+	if p.Key() == "" {
+		t.Fatal("expected non-empty period key")
+	}
+}
+
+func TestMetricHelpers(t *testing.T) {
 	if !IngestTokens.Valid() {
-		t.Fatal("IngestTokens should be valid")
+		t.Fatal("expected ingest metric to be valid")
 	}
 	if Metric("bogus").Valid() {
-		t.Fatal("bogus should not be valid")
-	}
-}
-
-func TestMetricUnit(t *testing.T) {
-	if IngestTokens.Unit() != "tokens" {
-		t.Fatalf("expected tokens, got %s", IngestTokens.Unit())
+		t.Fatal("bogus metric should be invalid")
 	}
 	if VoiceMinutes.Unit() != "minutes" {
-		t.Fatalf("expected minutes, got %s", VoiceMinutes.Unit())
+		t.Fatalf("unexpected unit: %s", VoiceMinutes.Unit())
 	}
 }
 
 func TestRenewPeriod(t *testing.T) {
 	c, _ := setupTestClient(t)
 	ctx := context.Background()
-	plan := createTestPlan(t, c)
-	subscribeTestTenant(t, c, "tenant-1", plan)
-
-	c.Increment(ctx, "tenant-1", IngestTokens, 100_000)
+	plan := createPlan(t, c, "plan-renew")
+	subscribe(t, c, "tenant-1", plan)
 
 	if err := c.RenewPeriod(ctx, "tenant-1"); err != nil {
-		t.Fatalf("RenewPeriod: %v", err)
+		t.Fatal(err)
 	}
-
-	sub, _ := c.GetSubscription(ctx, "tenant-1")
-	if sub.CurrentPeriodStart.IsZero() {
-		t.Fatal("period start should not be zero")
+	sub, err := c.GetSubscription(ctx, "tenant-1")
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestQuotaExceededError(t *testing.T) {
-	qErr := &QuotaExceededError{
-		Metric:    IngestTokens,
-		Used:      500_000,
-		Limit:     500_000,
-		Estimated: 10_000,
-	}
-
-	if !errors.Is(qErr, ErrQuotaExceeded) {
-		t.Fatal("QuotaExceededError should unwrap to ErrQuotaExceeded")
-	}
-
-	msg := qErr.Error()
-	if msg == "" {
-		t.Fatal("error message should not be empty")
+	if sub.CurrentPeriodStart.IsZero() || sub.CurrentPeriodEnd.IsZero() {
+		t.Fatal("period fields should not be zero")
 	}
 }

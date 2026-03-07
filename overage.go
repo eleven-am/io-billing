@@ -2,8 +2,11 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"math"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type OverageReport struct {
@@ -34,7 +37,7 @@ func (c *Client) GetOverageReport(ctx context.Context, tenantID string) (*Overag
 		return nil, err
 	}
 
-	period := CurrentPeriod(sub.StartedAt, time.Now())
+	period := CurrentPeriod(sub.StartedAt, c.opts.Now())
 
 	report := &OverageReport{
 		TenantID:    tenantID,
@@ -54,9 +57,9 @@ func (c *Client) GetOverageReport(ctx context.Context, tenantID string) (*Overag
 			continue
 		}
 
-		key := usageKey(tenantID, period, metric)
+		key := usageUsedKey(tenantID, period.Key(), metric)
 		used, err := c.redis.Get(ctx, key).Int64()
-		if err != nil && err.Error() == "redis: nil" {
+		if errors.Is(err, redis.Nil) {
 			used = 0
 		} else if err != nil {
 			return nil, err

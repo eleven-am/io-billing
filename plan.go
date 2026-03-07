@@ -2,6 +2,17 @@ package billing
 
 import "time"
 
+type EnforcementMode string
+
+const (
+	EnforcementHardCap EnforcementMode = "hard_cap"
+	EnforcementSoftCap EnforcementMode = "soft_cap"
+)
+
+func (m EnforcementMode) Valid() bool {
+	return m == EnforcementHardCap || m == EnforcementSoftCap
+}
+
 type Plan struct {
 	ID         string
 	Name       string
@@ -16,6 +27,7 @@ type Dimension struct {
 	Included    int64
 	OverageRate float64
 	Unit        string
+	Enforcement EnforcementMode
 }
 
 type TenantSubscription struct {

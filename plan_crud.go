@@ -3,10 +3,19 @@ package billing
 import "context"
 
 func (c *Client) CreatePlan(ctx context.Context, plan Plan) error {
+	if err := validatePlan(plan); err != nil {
+		return err
+	}
 	return c.store.CreatePlan(ctx, plan)
 }
 
 func (c *Client) UpdatePlan(ctx context.Context, plan Plan) error {
+	if plan.ID == "" {
+		return ErrInvalidPlan
+	}
+	if err := validatePlan(plan); err != nil {
+		return err
+	}
 	return c.store.UpdatePlan(ctx, plan)
 }
 

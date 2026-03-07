@@ -13,7 +13,7 @@ func (c *Client) Subscribe(ctx context.Context, tenantID, planID, polarCustomerI
 		return err
 	}
 
-	now := time.Now().UTC()
+	now := c.opts.Now()
 	period := Period{
 		Start: now,
 		End:   now.AddDate(0, 1, 0).Add(-time.Nanosecond),
@@ -62,7 +62,7 @@ func (c *Client) RenewPeriod(ctx context.Context, tenantID string) error {
 		return err
 	}
 
-	now := time.Now().UTC()
+	now := c.opts.Now()
 	newPeriod := CurrentPeriod(sub.StartedAt, now)
 
 	sub.CurrentPeriodStart = newPeriod.Start
@@ -87,10 +87,13 @@ func (c *Client) syncQuotasFromPlan(ctx context.Context, tenantID string, plan P
 
 		oKey := canOverageKey(tenantID, metric)
 		canOverage := "0"
-		if dim.OverageRate > 0 {
+		if dim.Enforcement == EnforcementSoftCap {
 			canOverage = "1"
 		}
 		pipe.Set(ctx, oKey, canOverage, 0)
+
+		eKey := enforcementKey(tenantID, metric)
+		pipe.Set(ctx, eKey, string(dim.Enforcement), 0)
 	}
 	_, err := pipe.Exec(ctx)
 	return err
@@ -99,8 +102,10 @@ func (c *Client) syncQuotasFromPlan(ctx context.Context, tenantID string, plan P
 func (c *Client) resetUsageCounters(ctx context.Context, tenantID string, period Period) error {
 	pipe := c.redis.Pipeline()
 	for _, metric := range AllMetrics {
-		key := usageKey(tenantID, period, metric)
-		pipe.Set(ctx, key, 0, 0)
+		usedKey := usageUsedKey(tenantID, period.Key(), metric)
+		reservedKey := usageReservedKey(tenantID, period.Key(), metric)
+		pipe.Set(ctx, usedKey, 0, 0)
+		pipe.Set(ctx, reservedKey, 0, 0)
 	}
 	_, err := pipe.Exec(ctx)
 	return err
