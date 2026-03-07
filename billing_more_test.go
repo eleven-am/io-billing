@@ -158,3 +158,141 @@ func TestStoreCreateLedgerEntryValidation(t *testing.T) {
 		t.Fatal("expected invalid ledger entry error")
 	}
 }
+
+func TestCheckPropagatesRedisFailure(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createPlan(t, c, "plan-redis-down")
+	subscribe(t, c, "tenant-down", plan)
+
+	if err := c.redis.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Check(ctx, "tenant-down", IngestTokens); err == nil {
+		t.Fatal("expected redis error")
+	}
+}
+
+func TestPlanLookupDoesNotMaskDBFailures(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+
+	sqlDB, err := c.store.db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.GetPlanByName(ctx, "anything")
+	if err == nil {
+		t.Fatal("expected db error")
+	}
+	if errors.Is(err, ErrPlanNotFound) {
+		t.Fatalf("unexpected ErrPlanNotFound masking db error: %v", err)
+	}
+}
+
+func TestSeedDefaultPlansPropagatesDBFailures(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+
+	sqlDB, err := c.store.db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.SeedDefaultPlans(ctx)
+	if err == nil {
+		t.Fatal("expected db error")
+	}
+	if errors.Is(err, ErrPlanNotFound) {
+		t.Fatalf("unexpected ErrPlanNotFound masking db error: %v", err)
+	}
+}
+
+func TestPlanAndSubscriptionNotFoundPaths(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+
+	if _, err := c.GetPlan(ctx, "missing-plan"); !errors.Is(err, ErrPlanNotFound) {
+		t.Fatalf("expected ErrPlanNotFound, got %v", err)
+	}
+	if _, err := c.GetSubscription(ctx, "missing-tenant"); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("expected ErrSubscriptionNotFound, got %v", err)
+	}
+}
+
+func TestGetPlanAndNameValidation(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+
+	if _, err := c.GetPlan(ctx, ""); !errors.Is(err, ErrInvalidPlanID) {
+		t.Fatalf("expected ErrInvalidPlanID, got %v", err)
+	}
+	if _, err := c.GetPlanByName(ctx, "   "); !errors.Is(err, ErrInvalidPlan) {
+		t.Fatalf("expected ErrInvalidPlan, got %v", err)
+	}
+}
+
+func TestDefaultOptionsAndModeNormalization(t *testing.T) {
+	opts := DefaultOptions()
+	if opts.OperationTTL <= 0 || opts.ReservationTTL <= 0 || opts.Now == nil {
+		t.Fatal("default options should be fully initialized")
+	}
+
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createPlan(t, c, "plan-mode-normalization")
+	subscribe(t, c, "tenant-mode", plan)
+
+	period := CurrentPeriod(c.opts.Now(), c.opts.Now())
+	enforcement := enforcementKey("tenant-mode", IngestTokens)
+	if err := c.redis.Set(ctx, enforcement, "unknown-mode", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	usage := usageUsedKey("tenant-mode", period.Key(), IngestTokens)
+	if err := c.redis.Set(ctx, usage, "not-an-int", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.Check(ctx, "tenant-mode", IngestTokens); err == nil {
+		t.Fatal("expected invalid redis integer parse error")
+	}
+}
+
+func TestSetCanOverageValidation(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+
+	if err := c.setCanOverage(ctx, "", IngestTokens, true); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+	if err := c.setCanOverage(ctx, "tenant", Metric("bad"), true); !errors.Is(err, ErrInvalidMetric) {
+		t.Fatalf("expected ErrInvalidMetric, got %v", err)
+	}
+}
+
+func TestSubscribeRollsBackWhenQuotaSyncFails(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	plan := createPlan(t, c, "plan-sub-rollback")
+
+	if err := c.redis.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := c.Subscribe(ctx, "tenant-sub-rollback", plan.ID, "polar")
+	if err == nil {
+		t.Fatal("expected subscribe error when redis is down")
+	}
+
+	_, err = c.store.GetSubscription(ctx, "tenant-sub-rollback")
+	if !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("expected subscription rollback, got %v", err)
+	}
+}

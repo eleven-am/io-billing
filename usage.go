@@ -11,6 +11,9 @@ import (
 const actionIncrement = "increment"
 
 func (c *Client) Increment(ctx context.Context, req IncrementRequest) error {
+	if err := validateTenantID(req.TenantID); err != nil {
+		return err
+	}
 	if !req.Metric.Valid() {
 		return ErrInvalidMetric
 	}
@@ -82,6 +85,9 @@ func (c *Client) Increment(ctx context.Context, req IncrementRequest) error {
 }
 
 func (c *Client) GetUsage(ctx context.Context, tenantID string, metric Metric) (int64, error) {
+	if err := validateTenantID(tenantID); err != nil {
+		return 0, err
+	}
 	if !metric.Valid() {
 		return 0, ErrInvalidMetric
 	}
@@ -102,6 +108,9 @@ func (c *Client) GetUsage(ctx context.Context, tenantID string, metric Metric) (
 }
 
 func (c *Client) GetAllUsage(ctx context.Context, tenantID string) (map[Metric]int64, error) {
+	if err := validateTenantID(tenantID); err != nil {
+		return nil, err
+	}
 	result := make(map[Metric]int64, len(AllMetrics))
 	for _, m := range AllMetrics {
 		val, err := c.GetUsage(ctx, tenantID, m)

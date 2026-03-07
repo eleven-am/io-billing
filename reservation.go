@@ -2,8 +2,6 @@ package billing
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"strconv"
 	"time"
 )
@@ -27,6 +25,9 @@ type Reservation struct {
 }
 
 func (c *Client) Reserve(ctx context.Context, req ReserveRequest) (*Reservation, error) {
+	if err := validateTenantID(req.TenantID); err != nil {
+		return nil, err
+	}
 	if !req.Metric.Valid() {
 		return nil, ErrInvalidMetric
 	}
@@ -144,6 +145,9 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	if req.Reservation == nil {
 		return ErrReservationNotFound
 	}
+	if err := validateTenantID(req.Reservation.TenantID); err != nil {
+		return err
+	}
 	if req.Actual < 0 {
 		return ErrInvalidAmount
 	}
@@ -222,6 +226,9 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 func (c *Client) Release(ctx context.Context, req ReleaseRequest) error {
 	if req.Reservation == nil {
 		return ErrReservationNotFound
+	}
+	if err := validateTenantID(req.Reservation.TenantID); err != nil {
+		return err
 	}
 	if err := validateOperationID(req.OperationID); err != nil {
 		return err
@@ -390,10 +397,4 @@ func mustParseRFC3339Date(input string) time.Time {
 		return time.Time{}
 	}
 	return ts
-}
-
-func newReservationID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }

@@ -27,6 +27,10 @@ type OverageItem struct {
 }
 
 func (c *Client) GetOverageReport(ctx context.Context, tenantID string) (*OverageReport, error) {
+	if err := validateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+
 	sub, err := c.store.GetSubscription(ctx, tenantID)
 	if err != nil {
 		return nil, err

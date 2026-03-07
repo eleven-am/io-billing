@@ -36,6 +36,20 @@ func validatePlan(plan Plan) error {
 	return nil
 }
 
+func validateTenantID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return ErrInvalidTenantID
+	}
+	return nil
+}
+
+func validatePlanID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return ErrInvalidPlanID
+	}
+	return nil
+}
+
 func validateOperationID(id string) error {
 	if strings.TrimSpace(id) == "" {
 		return ErrInvalidOperationID

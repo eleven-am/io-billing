@@ -1,6 +1,9 @@
 package billing
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 func (c *Client) SeedDefaultPlans(ctx context.Context) error {
 	plans := []Plan{
@@ -49,6 +52,9 @@ func (c *Client) SeedDefaultPlans(ctx context.Context) error {
 		_, err := c.store.GetPlanByName(ctx, plan.Name)
 		if err == nil {
 			continue
+		}
+		if !errors.Is(err, ErrPlanNotFound) {
+			return err
 		}
 		if err := c.store.CreatePlan(ctx, plan); err != nil {
 			return err

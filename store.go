@@ -2,11 +2,8 @@ package billing
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/eleven-am/io-billing/models"
@@ -37,72 +34,84 @@ func (s *postgresStore) CreatePlan(ctx context.Context, plan Plan) error {
 		id = newID()
 	}
 
-	model := models.BillingPlan{
-		ID:       id,
-		Name:     plan.Name,
-		PriceEUR: plan.PriceEUR,
-		Active:   plan.Active,
-	}
-
-	if err := s.db.WithContext(ctx).Create(&model).Error; err != nil {
-		return err
-	}
-
-	for metric, dim := range plan.Dimensions {
-		dimModel := models.BillingPlanDimension{
-			ID:          newID(),
-			PlanID:      model.ID,
-			Metric:      string(metric),
-			Included:    dim.Included,
-			OverageRate: dim.OverageRate,
-			Unit:        dim.Unit,
-			Enforcement: string(dim.Enforcement),
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		model := models.BillingPlan{
+			ID:       id,
+			Name:     plan.Name,
+			PriceEUR: plan.PriceEUR,
+			Active:   plan.Active,
 		}
-		if err := s.db.WithContext(ctx).Create(&dimModel).Error; err != nil {
+
+		if err := tx.Create(&model).Error; err != nil {
 			return err
 		}
-	}
 
-	return nil
+		for metric, dim := range plan.Dimensions {
+			dimModel := models.BillingPlanDimension{
+				ID:          newID(),
+				PlanID:      model.ID,
+				Metric:      string(metric),
+				Included:    dim.Included,
+				OverageRate: dim.OverageRate,
+				Unit:        dim.Unit,
+				Enforcement: string(dim.Enforcement),
+			}
+			if err := tx.Create(&dimModel).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 func (s *postgresStore) UpdatePlan(ctx context.Context, plan Plan) error {
-	err := s.db.WithContext(ctx).
-		Model(&models.BillingPlan{}).
-		Where("id = ?", plan.ID).
-		Updates(map[string]any{
-			"name":      plan.Name,
-			"price_eur": plan.PriceEUR,
-			"active":    plan.Active,
-		}).Error
-	if err != nil {
-		return err
-	}
-
-	s.db.WithContext(ctx).Where("plan_id = ?", plan.ID).Delete(&models.BillingPlanDimension{})
-
-	for metric, dim := range plan.Dimensions {
-		dimModel := models.BillingPlanDimension{
-			ID:          newID(),
-			PlanID:      plan.ID,
-			Metric:      string(metric),
-			Included:    dim.Included,
-			OverageRate: dim.OverageRate,
-			Unit:        dim.Unit,
-			Enforcement: string(dim.Enforcement),
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.
+			Model(&models.BillingPlan{}).
+			Where("id = ?", plan.ID).
+			Updates(map[string]any{
+				"name":      plan.Name,
+				"price_eur": plan.PriceEUR,
+				"active":    plan.Active,
+			})
+		if res.Error != nil {
+			return res.Error
 		}
-		if err := s.db.WithContext(ctx).Create(&dimModel).Error; err != nil {
+		if res.RowsAffected == 0 {
+			return ErrPlanNotFound
+		}
+
+		if err := tx.Where("plan_id = ?", plan.ID).Delete(&models.BillingPlanDimension{}).Error; err != nil {
 			return err
 		}
-	}
 
-	return nil
+		for metric, dim := range plan.Dimensions {
+			dimModel := models.BillingPlanDimension{
+				ID:          newID(),
+				PlanID:      plan.ID,
+				Metric:      string(metric),
+				Included:    dim.Included,
+				OverageRate: dim.OverageRate,
+				Unit:        dim.Unit,
+				Enforcement: string(dim.Enforcement),
+			}
+			if err := tx.Create(&dimModel).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 func (s *postgresStore) GetPlan(ctx context.Context, planID string) (Plan, error) {
 	var model models.BillingPlan
 	if err := s.db.WithContext(ctx).Where("id = ?", planID).First(&model).Error; err != nil {
-		return Plan{}, ErrPlanNotFound
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return Plan{}, ErrPlanNotFound
+		}
+		return Plan{}, err
 	}
 	return s.loadPlanDimensions(ctx, model)
 }
@@ -110,7 +119,10 @@ func (s *postgresStore) GetPlan(ctx context.Context, planID string) (Plan, error
 func (s *postgresStore) GetPlanByName(ctx context.Context, name string) (Plan, error) {
 	var model models.BillingPlan
 	if err := s.db.WithContext(ctx).Where("name = ?", name).First(&model).Error; err != nil {
-		return Plan{}, ErrPlanNotFound
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return Plan{}, ErrPlanNotFound
+		}
+		return Plan{}, err
 	}
 	return s.loadPlanDimensions(ctx, model)
 }
@@ -155,7 +167,10 @@ func (s *postgresStore) CreateSubscription(ctx context.Context, sub TenantSubscr
 func (s *postgresStore) GetSubscription(ctx context.Context, tenantID string) (TenantSubscription, error) {
 	var model models.BillingTenantSubscription
 	if err := s.db.WithContext(ctx).Where("tenant_id = ?", tenantID).First(&model).Error; err != nil {
-		return TenantSubscription{}, ErrSubscriptionNotFound
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return TenantSubscription{}, ErrSubscriptionNotFound
+		}
+		return TenantSubscription{}, err
 	}
 
 	return TenantSubscription{
@@ -173,7 +188,7 @@ func (s *postgresStore) GetSubscription(ctx context.Context, tenantID string) (T
 }
 
 func (s *postgresStore) UpdateSubscription(ctx context.Context, sub TenantSubscription) error {
-	return s.db.WithContext(ctx).
+	res := s.db.WithContext(ctx).
 		Model(&models.BillingTenantSubscription{}).
 		Where("id = ?", sub.ID).
 		Updates(map[string]any{
@@ -182,7 +197,21 @@ func (s *postgresStore) UpdateSubscription(ctx context.Context, sub TenantSubscr
 			"status":               sub.Status,
 			"current_period_start": sub.CurrentPeriodStart,
 			"current_period_end":   sub.CurrentPeriodEnd,
-		}).Error
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+	return nil
+}
+
+func (s *postgresStore) DeleteSubscription(ctx context.Context, tenantID string) error {
+	if err := s.db.WithContext(ctx).Where("tenant_id = ?", tenantID).Delete(&models.BillingTenantSubscription{}).Error; err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *postgresStore) loadPlanDimensions(ctx context.Context, model models.BillingPlan) (Plan, error) {
@@ -212,12 +241,6 @@ func (s *postgresStore) loadPlanDimensions(ctx context.Context, model models.Bil
 	}, nil
 }
 
-func newID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
 type LedgerEntry struct {
 	TenantID            string
 	SubscriptionID      string
@@ -237,7 +260,7 @@ type LedgerEntry struct {
 
 func (s *postgresStore) CreateLedgerEntry(ctx context.Context, entry LedgerEntry) error {
 	if entry.TenantID == "" || entry.OperationID == "" || entry.Action == "" {
-		return fmt.Errorf("invalid ledger entry")
+		return ErrInvalidLedgerEntry
 	}
 
 	metadata := "{}"
@@ -295,7 +318,11 @@ func (s *postgresStore) CreateLedgerEntry(ctx context.Context, entry LedgerEntry
 
 func parsePeriodKey(key string) (time.Time, error) {
 	if key == "" {
-		return time.Time{}, errors.New("empty period key")
+		return time.Time{}, ErrInvalidPeriodKey
 	}
-	return time.Parse("2006-01-02", key)
+	t, err := time.Parse("2006-01-02", key)
+	if err != nil {
+		return time.Time{}, ErrInvalidPeriodKey
+	}
+	return t, nil
 }

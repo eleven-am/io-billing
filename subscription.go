@@ -2,15 +2,23 @@ package billing
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"time"
 )
 
 func (c *Client) Subscribe(ctx context.Context, tenantID, planID, polarCustomerID string) error {
+	if err := validateTenantID(tenantID); err != nil {
+		return err
+	}
+	if err := validatePlanID(planID); err != nil {
+		return err
+	}
+
 	plan, err := c.store.GetPlan(ctx, planID)
 	if err != nil {
 		return err
+	}
+	if !plan.Active {
+		return ErrNoActivePlan
 	}
 
 	now := c.opts.Now()
@@ -34,14 +42,26 @@ func (c *Client) Subscribe(ctx context.Context, tenantID, planID, polarCustomerI
 		return err
 	}
 
-	return c.syncQuotasFromPlan(ctx, tenantID, plan)
+	if err := c.syncQuotasFromPlan(ctx, tenantID, plan); err != nil {
+		_ = c.store.DeleteSubscription(ctx, tenantID)
+		return err
+	}
+
+	return nil
 }
 
 func (c *Client) GetSubscription(ctx context.Context, tenantID string) (TenantSubscription, error) {
+	if err := validateTenantID(tenantID); err != nil {
+		return TenantSubscription{}, err
+	}
 	return c.store.GetSubscription(ctx, tenantID)
 }
 
 func (c *Client) CancelSubscription(ctx context.Context, tenantID string) error {
+	if err := validateTenantID(tenantID); err != nil {
+		return err
+	}
+
 	sub, err := c.store.GetSubscription(ctx, tenantID)
 	if err != nil {
 		return err
@@ -52,6 +72,10 @@ func (c *Client) CancelSubscription(ctx context.Context, tenantID string) error 
 }
 
 func (c *Client) RenewPeriod(ctx context.Context, tenantID string) error {
+	if err := validateTenantID(tenantID); err != nil {
+		return err
+	}
+
 	sub, err := c.store.GetSubscription(ctx, tenantID)
 	if err != nil {
 		return err
@@ -109,10 +133,4 @@ func (c *Client) resetUsageCounters(ctx context.Context, tenantID string, period
 	}
 	_, err := pipe.Exec(ctx)
 	return err
-}
-
-func newSubID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }

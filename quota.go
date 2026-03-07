@@ -20,6 +20,9 @@ type QuotaStatus struct {
 }
 
 func (c *Client) Check(ctx context.Context, tenantID string, metric Metric) (QuotaStatus, error) {
+	if err := validateTenantID(tenantID); err != nil {
+		return QuotaStatus{}, err
+	}
 	if !metric.Valid() {
 		return QuotaStatus{}, ErrInvalidMetric
 	}
@@ -42,13 +45,30 @@ func (c *Client) Check(ctx context.Context, tenantID string, metric Metric) (Quo
 	quotaCmd := pipe.Get(ctx, qKey)
 	overageCmd := pipe.Get(ctx, oKey)
 	enforcementCmd := pipe.Get(ctx, eKey)
-	_, _ = pipe.Exec(ctx)
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return QuotaStatus{}, err
+	}
 
-	used := getInt64OrZero(usageCmd)
-	reserved := getInt64OrZero(reservedCmd)
-	limit := getInt64OrZero(quotaCmd)
-	canOverage := getBoolOrFalse(overageCmd)
-	enforcement := getEnforcementOrDefault(enforcementCmd)
+	used, err := getInt64OrZero(usageCmd)
+	if err != nil {
+		return QuotaStatus{}, err
+	}
+	reserved, err := getInt64OrZero(reservedCmd)
+	if err != nil {
+		return QuotaStatus{}, err
+	}
+	limit, err := getInt64OrZero(quotaCmd)
+	if err != nil {
+		return QuotaStatus{}, err
+	}
+	canOverage, err := getBoolOrFalse(overageCmd)
+	if err != nil {
+		return QuotaStatus{}, err
+	}
+	enforcement, err := getEnforcementOrDefault(enforcementCmd)
+	if err != nil {
+		return QuotaStatus{}, err
+	}
 
 	remaining := limit - used - reserved
 	if remaining < 0 {
@@ -68,6 +88,9 @@ func (c *Client) Check(ctx context.Context, tenantID string, metric Metric) (Quo
 }
 
 func (c *Client) CheckMultiple(ctx context.Context, tenantID string, metrics []Metric) (map[Metric]QuotaStatus, error) {
+	if err := validateTenantID(tenantID); err != nil {
+		return nil, err
+	}
 	result := make(map[Metric]QuotaStatus, len(metrics))
 	for _, m := range metrics {
 		status, err := c.Check(ctx, tenantID, m)
@@ -80,18 +103,30 @@ func (c *Client) CheckMultiple(ctx context.Context, tenantID string, metrics []M
 }
 
 func (c *Client) SetQuota(ctx context.Context, tenantID string, metric Metric, limit int64) error {
+	if err := validateTenantID(tenantID); err != nil {
+		return err
+	}
 	if !metric.Valid() {
 		return ErrInvalidMetric
+	}
+	if limit < 0 {
+		return ErrInvalidAmount
 	}
 	key := quotaKey(tenantID, metric)
 	return c.redis.Set(ctx, key, limit, 0).Err()
 }
 
 func (c *Client) SetQuotas(ctx context.Context, tenantID string, quotas map[Metric]int64) error {
+	if err := validateTenantID(tenantID); err != nil {
+		return err
+	}
 	pipe := c.redis.Pipeline()
 	for metric, limit := range quotas {
 		if !metric.Valid() {
 			return ErrInvalidMetric
+		}
+		if limit < 0 {
+			return ErrInvalidAmount
 		}
 		key := quotaKey(tenantID, metric)
 		pipe.Set(ctx, key, limit, 0)
@@ -101,6 +136,12 @@ func (c *Client) SetQuotas(ctx context.Context, tenantID string, quotas map[Metr
 }
 
 func (c *Client) setCanOverage(ctx context.Context, tenantID string, metric Metric, canOverage bool) error {
+	if err := validateTenantID(tenantID); err != nil {
+		return err
+	}
+	if !metric.Valid() {
+		return ErrInvalidMetric
+	}
 	key := canOverageKey(tenantID, metric)
 	val := "0"
 	if canOverage {
@@ -109,38 +150,41 @@ func (c *Client) setCanOverage(ctx context.Context, tenantID string, metric Metr
 	return c.redis.Set(ctx, key, val, 0).Err()
 }
 
-func getInt64OrZero(cmd *redis.StringCmd) int64 {
+func getInt64OrZero(cmd *redis.StringCmd) (int64, error) {
 	val, err := cmd.Int64()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return 0
+			return 0, nil
 		}
-		return 0
+		return 0, err
 	}
-	return val
+	return val, nil
 }
 
-func getBoolOrFalse(cmd *redis.StringCmd) bool {
+func getBoolOrFalse(cmd *redis.StringCmd) (bool, error) {
 	val, err := cmd.Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return false
+			return false, nil
 		}
-		return false
+		return false, err
 	}
-	return val == "1" || val == "true"
+	return val == "1" || val == "true", nil
 }
 
-func getEnforcementOrDefault(cmd *redis.StringCmd) EnforcementMode {
+func getEnforcementOrDefault(cmd *redis.StringCmd) (EnforcementMode, error) {
 	val, err := cmd.Result()
 	if err != nil {
-		return EnforcementHardCap
+		if errors.Is(err, redis.Nil) {
+			return EnforcementHardCap, nil
+		}
+		return "", err
 	}
 	mode := EnforcementMode(val)
 	if !mode.Valid() {
-		return EnforcementHardCap
+		return EnforcementHardCap, nil
 	}
-	return mode
+	return mode, nil
 }
 
 func int64ToStr(v int64) string {
@@ -148,6 +192,9 @@ func int64ToStr(v int64) string {
 }
 
 func (c *Client) CanConsume(ctx context.Context, tenantID string, metric Metric, amount int64) (QuotaAdmission, error) {
+	if err := validateTenantID(tenantID); err != nil {
+		return QuotaAdmission{}, err
+	}
 	if amount <= 0 {
 		return QuotaAdmission{}, ErrInvalidAmount
 	}
@@ -167,7 +214,8 @@ func (c *Client) CanConsume(ctx context.Context, tenantID string, metric Metric,
 		CheckedAt:   c.opts.Now(),
 	}
 
-	if status.Enforcement == EnforcementSoftCap {
+	hardEnforced := status.Enforcement == EnforcementHardCap || !status.CanOverage
+	if !hardEnforced {
 		admission.Allowed = true
 		return admission, nil
 	}

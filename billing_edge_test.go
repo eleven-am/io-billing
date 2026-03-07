@@ -162,3 +162,62 @@ func TestToInt64AndToStringBranches(t *testing.T) {
 		t.Fatalf("expected empty string, got %q", s)
 	}
 }
+
+func TestInvalidTenantValidationAcrossSurface(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+
+	if _, err := c.Check(ctx, "", IngestTokens); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+	if _, err := c.CheckMultiple(ctx, "", []Metric{IngestTokens}); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+	if err := c.SetQuota(ctx, "", IngestTokens, 1); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+	if err := c.Increment(ctx, IncrementRequest{
+		TenantID:    "",
+		Metric:      IngestTokens,
+		Amount:      1,
+		OperationID: "op",
+	}); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+	if _, err := c.GetUsage(ctx, "", IngestTokens); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+	if _, err := c.GetOverageReport(ctx, ""); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+	if err := c.Subscribe(ctx, "", "plan", "polar"); !errors.Is(err, ErrInvalidTenantID) {
+		t.Fatalf("expected ErrInvalidTenantID, got %v", err)
+	}
+}
+
+func TestSetQuotaRejectsNegative(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+	err := c.SetQuota(ctx, "tenant", IngestTokens, -1)
+	if !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("expected ErrInvalidAmount, got %v", err)
+	}
+}
+
+func TestUpdatePlanNotFound(t *testing.T) {
+	c, _ := setupTestClient(t)
+	ctx := context.Background()
+
+	err := c.UpdatePlan(ctx, Plan{
+		ID:       "missing-plan",
+		Name:     "ghost",
+		PriceEUR: 1000,
+		Active:   true,
+		Dimensions: map[Metric]Dimension{
+			IngestTokens: {Included: 1, OverageRate: 1, Unit: "tokens", Enforcement: EnforcementSoftCap},
+		},
+	})
+	if !errors.Is(err, ErrPlanNotFound) {
+		t.Fatalf("expected ErrPlanNotFound, got %v", err)
+	}
+}
